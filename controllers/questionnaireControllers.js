@@ -100,26 +100,68 @@ exports.createQuestionnaire = async (req, res, next) => {
     }
 };
 
+function mergeQuestions(existingQuestions, updatedQuestions) {
+    const result = [];
+    console.log("Updated questions received:", updatedQuestions.map(q => q._id));
+    for (const updated of updatedQuestions) {
+      if (updated._id) {
+        const existing = existingQuestions.find(
+          (q) => q._id.toString() === updated._id.toString()
+        );
+  
+        if (existing) {
+          existing.text = updated.text;
+          existing.type = updated.type;
+          existing.options = Array.isArray(updated.options) ? updated.options : [];
+          result.push(existing);
+          continue;
+        }
+        const { text, type, options } = updated;
+        result.push({
+          text,
+          type,
+          options: Array.isArray(options) ? options : [],
+        });
+      } else {
+        const { text, type, options } = updated;
+        result.push({
+          text,
+          type,
+          options: Array.isArray(options) ? options : [],
+        });
+      }
+    }
+  
+    return result;
+  }
+  
+  
+
 exports.updateQuestionnaire = async (req, res, next) => {
     try {
-        const updatedQuestionnaire = await Questionnaire.findByIdAndUpdate(
-            req.params.id,
-            req.body,
-            { new: true }
+      const questionnaire = await Questionnaire.findById(req.params.id);
+      if (!questionnaire) {
+        const error = new Error("Could not find questionnaire.");
+        error.statusCode = 404;
+        throw error;
+      }
+      if (req.body.name !== undefined) questionnaire.name = req.body.name;
+      if (req.body.description !== undefined) questionnaire.description = req.body.description;
+      if (Array.isArray(req.body.questions)) {
+        questionnaire.questions = mergeQuestions(
+          questionnaire.questions,
+          req.body.questions
         );
-        if (!updatedQuestionnaire) {
-            const error = new Error('Could not find questionnaire.');
-            error.statusCode = 404;
-            throw error;
-        }
-        res.json(updatedQuestionnaire);
+      }
+  
+      const updated = await questionnaire.save();
+      res.json(updated);
     } catch (err) {
-        if (!err.statusCode) {
-            err.statusCode = 500;
-        }
-        next(err);
+      if (!err.statusCode) err.statusCode = 500;
+      next(err);
     }
-};
+  };
+  
 
 exports.deleteQuestionnaire = async (req, res, next) => {
     try {
@@ -141,6 +183,13 @@ exports.deleteQuestionnaire = async (req, res, next) => {
 exports.getStatistics = async (req, res, next) => {
     const questionnaireId = req.params.id;
     try {
+        const questionnaire = await Questionnaire.findById(questionnaireId);
+        const questionTextMap = new Map();
+
+        questionnaire.questions.forEach((q) => {
+        questionTextMap.set(q._id.toString(), q.text);
+        });
+
         const responses = await Response.find({ questionnaireId });
         if (responses.length === 0) return res.json({ avgTime: 0, completions: [], charts: [] });
         
@@ -148,39 +197,80 @@ exports.getStatistics = async (req, res, next) => {
             responses.reduce((sum, r) => sum + r.completionTime, 0) / responses.length
         );
 
-        const completionsByDate = {};
+        const completionsByDay = {};
+        const completionsByWeek = {};
+        const completionsByMonth = {};
+
         responses.forEach((r) => {
-            const day = new Date(r.createdAt).toISOString().slice(0, 10);
-            completionsByDate[day] = (completionsByDate[day] || 0) + 1;
+        const date = new Date(r.createdAt);
+
+        const day = date.toISOString().slice(0, 10);
+        completionsByDay[day] = (completionsByDay[day] || 0) + 1;
+
+        const year = date.getFullYear();
+        const janFirst = new Date(year, 0, 1);
+        const days = Math.floor((date - janFirst) / (24 * 60 * 60 * 1000));
+        const week = Math.ceil((days + janFirst.getDay() + 1) / 7);
+        const weekKey = `${year}-W${String(week).padStart(2, "0")}`;
+        completionsByWeek[weekKey] = (completionsByWeek[weekKey] || 0) + 1;
+
+        const monthKey = `${year}-${String(date.getMonth() + 1).padStart(2, "0")}`;
+        completionsByMonth[monthKey] = (completionsByMonth[monthKey] || 0) + 1;
         });
 
-        const questionMap = {};
+
+        const pieMap = new Map();
+
         responses.forEach((r) => {
-            r.answers.forEach(({ questionId, answer }) => {
-                if (!questionMap[questionId]) questionMap[questionId] = {};
-                const key = Array.isArray(answer) ? answer : [answer];
-                key.forEach((val) => {
-                questionMap[questionId][val] = (questionMap[questionId][val] || 0) + 1;
+            if (Array.isArray(r.answers)) {
+                r.answers.forEach(({ questionId, questionText, answer }) => {
+                    if (!questionId) return;
+
+                    const key = questionId.toString();
+
+                    if (!pieMap.has(key)) {
+                        pieMap.set(key, {
+                        questionText: questionText || "Unknown question",
+                        counts: new Map()
+                        });
+                    }
+
+                    const entry = pieMap.get(key);
+                    const answersArray = Array.isArray(answer) ? answer : [answer];
+
+                    answersArray.forEach((ans) => {
+                        entry.counts.set(ans, (entry.counts.get(ans) || 0) + 1);
+                    });
                 });
-            });
+            }
         });
 
-        const questionnaire = await Questionnaire.findById(questionnaireId);
-        const piecharts = questionnaire.questions.map((q) => ({
-            question: q.text,
-            data: Object.entries(questionMap[q._id] || {}).map(([option, count]) => ({
-                name: option,
-                value: count,
-            })),
-        }));
+
+        const piecharts = Array.from(pieMap.entries()).map(([questionId, { questionText, counts }]) => {
+            const latestText = questionTextMap.get(questionId);
+            const label = latestText
+              ? latestText
+              : `${questionText} (Deleted or Old Question)`;
+          
+            return {
+              question: label,
+              data: Array.from(counts.entries()).map(([name, value]) => ({ name, value })),
+            };
+          });
+          
+          
 
         res.json({
             avgTime,
-            completions: completionsByDate,
+            completions: completionsByDay,
+            completionsByWeek,
+            completionsByMonth,
             piecharts,
         });
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: "Failed to fetch statistics." });
+        if (!err.statusCode) {
+            err.statusCode = 500;
+        }
+        next(err);
     }
 };
